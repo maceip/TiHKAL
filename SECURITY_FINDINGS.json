@@ -1,0 +1,225 @@
+[
+  {
+    "severity": "HIGH",
+    "location": ".github/workflows/vet-release.yml",
+    "title": "VET release workflow lacks artifact attestation and uses overly broad contents:write permission",
+    "description": "The vet-release.yml workflow builds release binaries on macOS and Windows, uploads them as GitHub artifacts, then downloads and publishes them as a GitHub Release. The workflow uses SHA-256 checksums for integrity but lacks SLSA provenance attestation or artifact signing. The top-level `permissions: contents: write` grants every job in the workflow write access to repository contents, but only the `publish-release` job actually needs it. Additionally, artifacts uploaded by `actions/upload-artifact` and downloaded by `actions/download-artifact` in a multi-job pipeline rely solely on the artifact name for binding; a compromised parallel workflow or a race condition could substitute a malicious artifact with the same name before download.",
+    "impact": "An attacker who compromises a build runner or performs artifact substitution between the build and publish jobs could ship a backdoored VET binary to all downstream users. SHA-256 checksums are self-attesting (generated alongside the binary on the same potentially-compromised runner) and provide no supply-chain guarantee.",
+    "attack_path": "1. Attacker compromises the macOS or Windows GitHub-hosted runner (or exploits a cache poisoning vector). 2. Modified binary is built with a backdoor. 3. SHA-256 checksum is computed on the compromised binary, so it matches. 4. publish-release job downloads the malicious artifact and publishes it as a signed GitHub Release. 5. Users download and trust the release based on the self-attesting checksum.",
+    "evidence": [
+      "vet-release.yml:29 (permissions: contents: write at top level)",
+      "vet-release.yml:57-58 (shasum computed on same runner as build)",
+      "vet-release.yml:62-66 (upload-artifact with name-only binding)",
+      "vet-release.yml:128-131 (download-artifact with merge-multiple: true)"
+    ],
+    "remediation": "1. Add SLSA provenance attestation using `actions/attest-build-provenance` or a SLSA L3-compatible builder. 2. Scope `permissions: contents: write` down to only the `publish-release` job using per-job permissions blocks. 3. Consider signing release binaries with Sigstore/cosign. 4. Pin the artifact name to a content-derived hash to prevent substitution.",
+    "poc_video_notes": "Show the workflow YAML side-by-side with a SLSA-compliant reference. Highlight that checksums are self-attesting. Demonstrate the lack of per-job permission scoping."
+  },
+  {
+    "severity": "HIGH",
+    "location": "runtime/components/rust/minijinja_template.rs",
+    "title": "Server-Side Template Injection (SSTI) via user-controlled Jinja2 template source",
+    "description": "The `new_minijinja_template` function accepts an arbitrary template source string and compiles it into an executable MiniJinja template. The `detect_capabilities` function then trial-renders this template with test data. If an attacker can influence the template source (e.g., via a malicious model's `chat_template` field from a Hugging Face model card), they can inject arbitrary Jinja2 logic. While MiniJinja is sandboxed and lacks Python's `__import__`, the template can: (a) call `raise_exception` to trigger denial-of-service, (b) exfiltrate variables from the rendering context via crafted output, (c) call `strftime_now` with format strings to probe system state, and (d) use recursive macros / large loop expansions for CPU/memory DoS.",
+    "impact": "A malicious model's chat_template could cause denial of service (infinite loops, memory exhaustion), leak context variables (messages, tools, extra_context) into model output, or trigger application crashes through raise_exception. Since this runs in the inference pipeline, it affects availability of the entire LM runtime.",
+    "attack_path": "1. Attacker publishes a Hugging Face model with a malicious `chat_template` in `tokenizer_config.json`. 2. User loads the model in litert-lm. 3. Template source is passed to `new_minijinja_template`. 4. `detect_capabilities` trial-renders the template, executing attacker code. 5. Subsequent `apply()` calls continue executing the malicious template on every inference request.",
+    "evidence": [
+      "minijinja_template.rs:138-147 (new_minijinja_template accepts arbitrary source)",
+      "minijinja_template.rs:75-136 (detect_capabilities trial-renders untrusted template)",
+      "minijinja_template.rs:149-166 (strftime_now exposed as template function)",
+      "minijinja_template.rs:168-170 (raise_exception exposed as template function)",
+      "minijinja_template.rs:284-290 (extra_context keys injected into render context)"
+    ],
+    "remediation": "1. Add resource limits to the MiniJinja environment (max recursion depth, max output size, max loop iterations) using `Environment::set_fuel`. 2. Remove or restrict `raise_exception` from the template environment. 3. Consider validating template source against a restricted subset of Jinja2 before compilation. 4. Sandbox template rendering in a separate process/thread with timeout.",
+    "poc_video_notes": "Create a tokenizer_config.json with `chat_template` set to `{% for i in range(999999999) %}x{% endfor %}` and show memory/CPU exhaustion during `detect_capabilities`."
+  },
+  {
+    "severity": "HIGH",
+    "location": ".github/workflows/nightly-linux-x64.yml",
+    "title": "Nightly PyPI publish workflows lack artifact attestation and have no provenance for published wheels",
+    "description": "All three nightly workflows (nightly-linux-x64.yml, nightly-linux-arm64.yml, nightly-mac-arm64.yml) build Python wheels and publish them directly to PyPI using `uv publish` with a static API token. The build and publish steps run in the same job with no provenance attestation, no SLSA builder, and no signature on the published wheel. The PYPI_UPLOAD_TOKEN secret is exposed as an environment variable to the entire publish step. Any compromise of the build environment would allow publishing a malicious wheel to PyPI that would be installed by all downstream `pip install litert-lm` users.",
+    "impact": "A compromised nightly build could push a backdoored Python package to PyPI, affecting all users who install or upgrade litert-lm via pip. This is a supply-chain attack with potentially massive blast radius given PyPI's role as a primary distribution channel.",
+    "attack_path": "1. Attacker compromises the build runner (e.g., via Bazel cache poisoning, dependency confusion, or runner exploit). 2. Malicious code is injected into the built wheel. 3. The `uv publish` step uploads the compromised wheel to PyPI using the stored PYPI_UPLOAD_TOKEN. 4. Users install the backdoored package via `pip install litert-lm`.",
+    "evidence": [
+      "nightly-linux-x64.yml:66-75 (PYPI_UPLOAD_TOKEN exposed, uv publish with no attestation)",
+      "nightly-mac-arm64.yml:63-69 (same pattern)",
+      "nightly-linux-arm64.yml:71-76 (same pattern)",
+      "nightly-linux-x64.yml:97-102 (CLI wheel also published without attestation)"
+    ],
+    "remediation": "1. Use PyPI Trusted Publishers (OIDC) instead of a static API token. 2. Add SLSA provenance attestation to published wheels. 3. Separate build and publish into distinct jobs with artifact integrity verification. 4. Add wheel content validation/signing before publish.",
+    "poc_video_notes": "Show the workflow lacks any provenance metadata. Compare with the Python packaging security recommendations at https://docs.pypi.org/trusted-publishers/."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "tools/vet/vet_main.cc",
+    "title": "Arbitrary file write via vet handoff --out without path validation",
+    "description": "The `RunHandoff` function accepts a `--out` flag that specifies an output file path. This path is used directly in `std::ofstream output(out_path, ...)` without any validation, sanitization, or confinement to the VET root directory. An agent (or a malicious prompt injection that causes an agent to run `vet handoff --out /etc/cron.d/backdoor`) can write arbitrary content to any file writable by the process user.",
+    "impact": "An attacker who can influence the `--out` argument (e.g., via prompt injection in an agent workflow, or by controlling the calling script) can write attacker-controlled JSON content to arbitrary filesystem locations. This could overwrite configuration files, cron jobs, SSH authorized_keys, or other sensitive files.",
+    "attack_path": "1. Attacker crafts a prompt injection that causes the coding agent to run `vet handoff --out ~/.ssh/authorized_keys --task 'ssh-rsa AAAA...'`. 2. The handoff output (which includes the task field verbatim) is written to the target path. 3. While the output format is structured, the attacker-controlled `task` field appears in the output and partial control over file contents is sufficient for many attack vectors.",
+    "evidence": [
+      "vet_main.cc:694 (out_path is a raw string with no validation)",
+      "vet_main.cc:776-778 (std::ofstream opens the path directly with no confinement)",
+      "vet_main.cc:718-721 (--out value taken directly from user input)"
+    ],
+    "remediation": "1. Validate that the output path is relative and does not contain `..` components. 2. Resolve the path and verify it stays within the VET root directory or the current working directory. 3. Alternatively, restrict the output path to the session directory.",
+    "poc_video_notes": "Run `vet init && vet record --type user --payload test && vet handoff --task 'malicious content' --format text --out /tmp/arbitrary-write-test` and show that the file is created at the arbitrary path."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": ".claude/settings.json",
+    "title": "Agent hook configurations execute PowerShell/Python scripts with unsanitized environment variable paths",
+    "description": "The Claude, Codex, Gemini, and Cursor agent hook configurations all invoke external scripts (invoke_dpm_gate.ps1 or dpm_gate.py) using paths derived from environment variables like `${CLAUDE_PROJECT_DIR}`. These environment variables are set by the agent host and could be manipulated. The `.claude/settings.json` uses `-ExecutionPolicy Bypass` which disables PowerShell script signing enforcement. The `.codex/config.toml` passes the entire command as a single string that is parsed by the shell. The hook scripts read arbitrary JSON from stdin (the hook event payload) and process it without schema validation.",
+    "impact": "If an attacker can control or influence the environment variables (CLAUDE_PROJECT_DIR, etc.) or if the project is cloned into a directory with a malicious path, the hooks will execute attacker-controlled scripts. The `-ExecutionPolicy Bypass` flag means even signed-script policies are circumvented. On a shared machine, another user could plant a malicious `dpm_gate.py` in the expected path.",
+    "attack_path": "1. Attacker creates a repository with a malicious `.claude/settings.json` (or `.codex/config.toml`) that points to a different script. 2. When a developer clones and opens the project, the agent automatically loads these hook configurations. 3. The hooks execute on every tool use, session start, and prompt submission, running the attacker's script with the developer's privileges.",
+    "evidence": [
+      ".claude/settings.json:9-11 (PowerShell with -ExecutionPolicy Bypass)",
+      ".claude/settings.json:15-16 (${CLAUDE_PROJECT_DIR} in command args)",
+      ".codex/config.toml:9 (entire command as single string with powershell.exe)",
+      ".cursor/hooks.json:6 (python command with relative path)",
+      ".gemini/settings.json:14 (python command with relative path)"
+    ],
+    "remediation": "1. Remove `-ExecutionPolicy Bypass` and rely on properly signed scripts. 2. Use absolute paths or validate that the resolved script path is within the repository. 3. Add integrity checks (hash verification) for the hook scripts before execution. 4. Document the security implications of these hook configurations in the repository README.",
+    "poc_video_notes": "Show how cloning the repo and opening it in Claude Code automatically triggers the hook scripts. Demonstrate that modifying dpm_gate.py in a fork would execute attacker code on anyone who clones and opens the fork."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "tools/vet/vet_trace.cc",
+    "title": "Handoff bundle verification only checks digest match, not content binding of output_text to trace",
+    "description": "The `VerifyHandoffBundle` function verifies that the trace_digest in the bundle matches the live event log file, and that event counts match. However, it does not verify that the `output_text` field in the bundle was actually derived from the events in the log. An attacker who has write access to the event log (but not to the bundle) cannot forge the trace digest. But an attacker who can modify the bundle JSON (the common threat model, since bundles are passed between agents) can replace the `output_text` with arbitrary content while keeping the same valid `trace_digest` and `aid_digest` that match the on-disk files. The verification will pass because none of the checks validate the relationship between `output_text` and the actual events.",
+    "impact": "A malicious host or intermediary can tamper with the handoff bundle's `output_text` (the human-readable summary and recommendations passed to the next agent) while leaving all cryptographic checks intact. The receiving agent would get a `VERIFIED` result but act on fabricated instructions/context, potentially making decisions based on false information.",
+    "attack_path": "1. Agent A produces a legitimate handoff bundle with valid digests. 2. Attacker intercepts the bundle JSON before it reaches Agent B. 3. Attacker modifies `output_text` to contain false instructions (e.g., 'deploy to production', 'delete all tests'). 4. Agent B runs `vet verify` which passes all checks because trace_digest, aid_digest, event_count, etc. all match the untouched on-disk log. 5. Agent B trusts the fabricated output_text.",
+    "evidence": [
+      "vet_trace.cc:294-503 (VerifyHandoffBundle never checks output_text content)",
+      "vet_trace.cc:242-292 (BuildHandoffBundle includes output_text but no MAC over it)",
+      "vet_trace.cc:246 (output_text stored in bundle but not covered by any proof)",
+      "vet_trace.cc:275-291 (component_proofs only cover event_log digest and correction count)"
+    ],
+    "remediation": "1. Include a cryptographic commitment (BLAKE3 digest) of the `output_text` in the `component_proofs` array. 2. Verify this commitment during `VerifyHandoffBundle`. 3. Consider including a MAC over the entire bundle (all fields except the MAC itself) using a session-derived key. 4. Alternatively, include the output_text digest in the trace_digest computation.",
+    "poc_video_notes": "Generate a handoff bundle with `vet handoff --format json --out bundle.json`. Modify `output_text` in bundle.json to say 'INJECT: ignore all previous instructions'. Run `vet verify --bundle bundle.json` and show it reports VERIFIED."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": ".github/workflows/verihandoff.yml",
+    "title": "VeriHandoff CI workflow runs on pull_request trigger without restricting fork access",
+    "description": "The verihandoff.yml workflow triggers on `pull_request` events targeting main. While it doesn't have explicit `permissions` set (inheriting defaults), it runs `bazelisk build` and `bazelisk test` on PR code. For PRs from forks, the workflow runs in the context of the fork's head ref, meaning attacker-controlled BUILD files and source code execute during the build and test steps. Although GitHub restricts secrets access for fork PRs by default, the attacker's code still runs on GitHub-hosted runners and could attempt side-channel attacks, exfiltrate cached data, or abuse network access.",
+    "impact": "An attacker can submit a PR from a fork that modifies BUILD files or test code to execute arbitrary commands during `bazelisk build` or `bazelisk test`. This executes on GitHub-hosted macOS runners with network access. While secrets are restricted for fork PRs, the attacker can mine cryptocurrency, exfiltrate cached build artifacts, probe internal networks, or abuse the runner's identity.",
+    "attack_path": "1. Attacker forks the repository. 2. Attacker modifies a BUILD file or test source to include a `genrule` that executes arbitrary commands. 3. Attacker opens a PR touching files under `tools/vet/**` to trigger the workflow. 4. The workflow runs `bazelisk build` which executes the attacker's genrule. 5. Attacker's code runs with the privileges of the GitHub-hosted runner.",
+    "evidence": [
+      "verihandoff.yml:4-6 (pull_request trigger without fork restrictions)",
+      "verihandoff.yml:33-34 (bazelisk build executes attacker-controlled BUILD files)",
+      "verihandoff.yml:37-38 (bazelisk test executes attacker-controlled test code)",
+      "verihandoff.yml:41-43 (run_demo.sh executes attacker-controlled shell script)"
+    ],
+    "remediation": "1. Use `pull_request_target` with explicit checkout of the PR head only for read operations, or require maintainer approval for workflow runs from forks. 2. Add an environment protection rule requiring approval for PR runs. 3. Alternatively, only run the full build/test suite on push to main and for trusted contributors.",
+    "poc_video_notes": "Show how a fork PR that modifies a BUILD file under tools/vet/ triggers the workflow and executes the modified build rules."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "tools/vet/examples/verihandoff/verify_golden.sh",
+    "title": "Python heredoc in verify_golden.sh passes shell-expanded variable as sys.argv, enabling injection",
+    "description": "In `verify_golden.sh`, the output of `vet verify` is captured into the shell variable `ACTUAL`, then passed as `sys.argv[1]` to an inline Python script via `python3 - <<'PY' \"${ACTUAL}\" \"${EXPECTED}\"`. The `ACTUAL` variable contains the raw JSON output of the vet CLI. While the heredoc delimiter is quoted (preventing heredoc expansion), the variable `${ACTUAL}` is passed as a shell argument. If the vet verify output contains shell metacharacters or is extremely large, it could cause argument-list overflow or parsing issues. More critically, `json.loads(sys.argv[1])` parses the output without size limits, and a crafted bundle could cause the verification script to consume excessive memory during JSON parsing.",
+    "impact": "A maliciously crafted handoff bundle designed to produce extremely large verify output could cause the CI gate to crash due to memory exhaustion or ARG_MAX overflow, effectively bypassing the golden-bundle verification gate. An attacker who can influence the golden fixtures (via a PR) could also craft a fixture that passes the weak equality checks.",
+    "attack_path": "1. Attacker submits a PR that modifies the golden fixtures to include a bundle with extremely large failure_details. 2. The verify_golden.sh script captures the large output into ACTUAL. 3. Passing ACTUAL as a command-line argument exceeds ARG_MAX or causes memory exhaustion in json.loads. 4. The script crashes, and depending on CI configuration, the gate may be bypassed.",
+    "evidence": [
+      "verify_golden.sh:24-25 (ACTUAL captures unbounded vet verify output)",
+      "verify_golden.sh:27 (ACTUAL passed as sys.argv[1] to Python)",
+      "verify_golden.sh:31 (json.loads on argv with no size limit)",
+      "verify_golden.sh:34-37 (only checks verified=true, not structural equality)"
+    ],
+    "remediation": "1. Write the vet verify output to a temporary file and have the Python script read from the file instead of sys.argv. 2. Add size limits to the captured output. 3. Strengthen the golden verification to check structural equality of all fields, not just `verified` and `checks_failed`.",
+    "poc_video_notes": "Show how modifying the golden fixtures in a PR could bypass the verification gate by crafting output that passes the loose checks."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "tools/agent_hooks/dpm_gate.py",
+    "title": "DPM gate hook state file TOCTOU race and world-readable sensitive data",
+    "description": "The `dpm_gate.py` hook maintains state in `.dpm-agent-hooks/state.json` and `.dpm-agent-hooks/ledger.jsonl`. The `save_state` function uses a tmp-file-then-rename pattern (good), but `load_state` and `append_ledger` have no file locking, creating TOCTOU race conditions when multiple agent sessions or hooks fire concurrently. The ledger file contains prompt text, tool inputs (including file contents and commands), and tool responses, which may include secrets. These files are created with default permissions (likely 0644) in the project directory, making them readable by any user on the system.",
+    "impact": "Concurrent hook invocations can corrupt the state file or ledger, causing the DPM gate to lose correction state and allow invalidated facts to propagate. The world-readable ledger file may leak secrets, API keys, file contents, and shell commands to other users on shared development machines.",
+    "attack_path": "1. Multiple agent hooks fire concurrently (e.g., PostToolUse and UserPromptSubmit in rapid succession). 2. Both read state.json, one writes a correction, the other overwrites with stale state, losing the correction. 3. Subsequently, the gate fails to block tool calls that reference invalidated facts. Alternatively: 4. On a shared machine, attacker reads .dpm-agent-hooks/ledger.jsonl to extract secrets from recorded tool inputs/outputs.",
+    "evidence": [
+      "dpm_gate.py:87-92 (load_state reads without lock)",
+      "dpm_gate.py:106-116 (append_ledger opens in append mode without lock)",
+      "dpm_gate.py:95-103 (save_state uses tmp+rename but no lock coordination with load)",
+      "dpm_gate.py:127-128 (prompt text truncated to 2000 chars but still logged)",
+      "dpm_gate.py:129-130 (tool_input logged including command contents)"
+    ],
+    "remediation": "1. Use `fcntl.flock` or a lockfile to serialize access to state.json and ledger.jsonl. 2. Set restrictive file permissions (0600) when creating state files. 3. Consider encrypting or redacting sensitive data in the ledger (API keys, tokens, passwords). 4. Add a `.gitignore` entry for `.dpm-agent-hooks/` to prevent accidental commits of the ledger.",
+    "poc_video_notes": "Run two concurrent vet correction commands and show that one correction can be lost due to the race condition in load/save state."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "runtime/components/rust/minijinja_template.rs",
+    "title": "chrono format string injection via strftime_now allows locale-dependent information disclosure",
+    "description": "The `strftime_now` function takes a format string from the template context and passes it directly to `chrono::DateTime::format()`. While chrono's format function is not as dangerous as C's strftime (no %n or %s buffer overflows), an attacker-controlled format string can: (1) produce extremely long output strings via repeated format specifiers, causing memory exhaustion, (2) probe system locale/timezone configuration via locale-sensitive specifiers, and (3) the `now` timestamp parameter is controllable from the template inputs, allowing probing of arbitrary historical dates.",
+    "impact": "A malicious template could use strftime_now with a very long format string or with many repeated specifiers to generate extremely large output strings, causing memory exhaustion in the rendering pipeline. Timezone and locale information could be used for environment fingerprinting.",
+    "attack_path": "1. Attacker crafts a model chat_template containing `{{ strftime_now('%Y' * 1000000) }}`. 2. Template rendering calls strftime_now which formats the date with the huge format string. 3. The resulting output string consumes excessive memory.",
+    "evidence": [
+      "minijinja_template.rs:149-166 (strftime_now passes format string directly to chrono)",
+      "minijinja_template.rs:165 (dt.format(&format).to_string() with unbounded output)",
+      "minijinja_template.rs:261 (strftime_now registered as template function)"
+    ],
+    "remediation": "1. Limit the length of the format string parameter (e.g., max 256 characters). 2. Limit the output length of the formatted string. 3. Whitelist allowed format specifiers to only standard date/time codes.",
+    "poc_video_notes": "Create a template with `{{ strftime_now('%Y%m%d' * 100000) }}` and measure memory consumption during rendering."
+  },
+  {
+    "severity": "LOW",
+    "location": "tools/vet/vet_main.cc",
+    "title": "VET CLI --root flag allows path traversal for reading and writing session data",
+    "description": "The `--root` flag in vet_main.cc sets the base directory for all VET operations. While the `SanitizeIdentity` function sanitizes the `--tenant` and `--session` values (removing path separators and dot-segments), the `--root` path itself is used verbatim. This means `vet init --root /etc/vet` or `vet init --root ../../../sensitive-dir` would create directories and write files (aid.json, events.dpmlog) in arbitrary locations. The EventSourcedLog's `IsValidIdentityComponent` validates tenant_id and session_id, but the root path is never validated.",
+    "impact": "A user or script that passes an unsanitized path to `--root` could inadvertently create VET data files in sensitive filesystem locations. While this requires the caller to pass a malicious --root value (reducing exploitability), in agent workflows where the --root flag is constructed from untrusted input, this could lead to arbitrary directory creation and file write.",
+    "attack_path": "1. An agent workflow constructs the --root flag from user input or environment variable. 2. Attacker provides a malicious root path like `--root /tmp/../etc/cron.d`. 3. `vet init` creates directories and writes aid.json at the traversed path.",
+    "evidence": [
+      "vet_main.cc:164 (root stored as raw string from user input)",
+      "vet_main.cc:173 (--root parsed without validation)",
+      "vet_main.cc:367-369 (create_directories called on unsanitized root + tenant + session)",
+      "vet_aid.cc:32-41 (MakeSessionPaths uses root directly in path construction)"
+    ],
+    "remediation": "1. Validate that the --root path does not contain `..` segments after resolution. 2. Canonicalize the path and verify it stays within expected bounds. 3. Alternatively, restrict --root to be a relative path within the current working directory.",
+    "poc_video_notes": "Run `vet init --root /tmp/test-traversal/../../../tmp/vet-escape` and show that directories are created at the traversed path."
+  },
+  {
+    "severity": "LOW",
+    "location": ".github/workflows/vet-release.yml",
+    "title": "VET release workflow triggers on every push to main, enabling automated release of unreviewed code",
+    "description": "The vet-release.yml workflow triggers on `push` to `main` (line 6) in addition to `workflow_dispatch`. This means every merge to main automatically triggers a release build and publish pipeline. While the `guard-main` job verifies the ref is main, the workflow will create a new release tag and publish binaries for every single push to main, not just intentional release commits. The `VET_BUMP` defaults to 'patch' for push events, meaning every merge bumps the version.",
+    "impact": "Unintentional releases could be published for every PR merge to main. If a PR containing vulnerabilities is merged, a release is immediately cut and published before anyone can review the release contents. This reduces the window for catching supply-chain issues.",
+    "attack_path": "1. Attacker submits a PR with a subtle backdoor in VET code. 2. PR passes review and is merged to main. 3. The push trigger immediately starts the release workflow. 4. A new VET release is automatically published with the backdoored code.",
+    "evidence": [
+      "vet-release.yml:4-6 (push trigger on main)",
+      "vet-release.yml:119 (VET_BUMP defaults to 'patch' for push events)",
+      "vet-release.yml:173-196 (release is created and published automatically)"
+    ],
+    "remediation": "1. Remove the `push` trigger and only use `workflow_dispatch` for intentional releases. 2. Alternatively, add a path filter to only trigger on changes to `tools/vet/**`. 3. Add a manual approval step (GitHub environment protection rule) before the publish-release job.",
+    "poc_video_notes": "Show the workflow trigger configuration and demonstrate that any merge to main triggers a release."
+  },
+  {
+    "severity": "LOW",
+    "location": "tools/vet/examples/verihandoff/run_demo.sh",
+    "title": "VeriHandoff demo scripts use environment variable VET_BIN for binary path without validation",
+    "description": "All three VeriHandoff shell scripts (run_demo.sh, verify_golden.sh, regenerate_golden.sh) accept the VET binary path from the `VET_BIN` environment variable via `VET=\"${VET_BIN:-...}\"`. The variable is used directly as a command to execute (`\"${VET}\" init`, `\"${VET}\" verify`, etc.) without validating that it points to a legitimate VET binary. If an attacker can set the VET_BIN environment variable (e.g., in a CI environment or shared developer machine), they can redirect execution to an arbitrary binary.",
+    "impact": "If VET_BIN is set to a malicious binary, all subsequent VET commands in the demo/CI scripts execute the attacker's code instead. In CI, this could exfiltrate secrets or tamper with test results. The scripts are also used in the verihandoff.yml CI workflow.",
+    "attack_path": "1. Attacker sets VET_BIN=/tmp/malicious-binary in the environment. 2. Demo or CI script sources VET_BIN and assigns it to VET. 3. All VET commands execute the malicious binary. 4. Malicious binary mimics VET output (returns verified=true) while performing side effects.",
+    "evidence": [
+      "run_demo.sh:7 (VET=${VET_BIN:-...})",
+      "verify_golden.sh:7 (same pattern)",
+      "regenerate_golden.sh:7 (same pattern)",
+      "run_demo.sh:15 (checks -x but not provenance of the binary)"
+    ],
+    "remediation": "1. Validate the VET_BIN binary by checking its hash against a known-good value. 2. In CI workflows, never use VET_BIN from the environment; always build from source. 3. Add a warning when VET_BIN is overridden from the default.",
+    "poc_video_notes": "Set VET_BIN to a script that echoes 'verified: true' and show the demo script passes all checks with the fake binary."
+  },
+  {
+    "severity": "LOW",
+    "location": "tools/vet/vet_aid.cc",
+    "title": "AID digest computed from non-canonical JSON serialization, enabling subtle digest mismatches",
+    "description": "The `ComputeAidDigest` function computes a BLAKE3 hash of `aid.dump()` (compact JSON serialization). However, the AID is stored on disk as `aid.dump(2)` (pretty-printed with indent=2). The digest is computed from the compact form, but if a verifier reads the file and computes the digest from the raw file bytes, they'll get a different hash. Additionally, `nlohmann::ordered_json::dump()` output depends on insertion order and floating-point formatting, which could vary across compiler versions or platforms, leading to different digests for semantically identical documents.",
+    "impact": "Cross-platform or cross-version verification could produce false negatives (verification failures for legitimate bundles) if the JSON serialization differs. This is a correctness issue that undermines trust in the verification system - users may learn to ignore verification failures, weakening the security model.",
+    "attack_path": "1. Agent A on Linux generates a handoff bundle with aid_digest computed from compact JSON. 2. Agent B on macOS reads the pretty-printed aid.json and computes a digest from the file bytes. 3. Digests don't match, verification fails. 4. Users learn to ignore verification failures, reducing the security value of the entire VET verification system.",
+    "evidence": [
+      "vet_aid.cc:116 (aid.dump(2) writes pretty-printed to disk)",
+      "vet_aid.cc:185 (aid.dump() computes digest from compact form, no indent)",
+      "vet_trace.cc:347-348 (verifier re-reads AID from file, computes digest from parsed+re-serialized form)"
+    ],
+    "remediation": "1. Use a canonical JSON serialization (e.g., JCS/RFC 8785) for digest computation. 2. Alternatively, always compute the digest from the raw file bytes, not from re-serialization. 3. Document the exact serialization format used for digest computation.",
+    "poc_video_notes": "Show that reading the AID file as bytes and hashing produces a different digest than parsing and re-serializing. Demonstrate a cross-platform scenario where verification fails for a legitimate bundle."
+  }
+]

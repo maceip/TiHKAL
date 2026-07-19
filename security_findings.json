@@ -1,0 +1,185 @@
+[
+  {
+    "severity": "HIGH",
+    "location": "kotlin/java/com/google/ai/edge/litertlm/Session.kt",
+    "title": "Session TOCTOU race: checkIsAlive() does not prevent concurrent use-after-free",
+    "description": "The Session class uses AtomicBoolean `_isAlive` and a non-synchronized `checkIsAlive()` method. There is a Time-Of-Check-to-Time-Of-Use (TOCTOU) race between `checkIsAlive()` and the subsequent JNI call. Thread A can call `close()` between thread B's `checkIsAlive()` passing and thread B's actual JNI method invocation (e.g., `nativeRunPrefill`). Once `close()` calls `nativeDeleteSession(handle)`, the `handle` becomes a dangling pointer. Thread B then invokes a JNI method on the freed native pointer, causing a use-after-free in native code. Unlike the Conversation close() UAF already reported (which involves calling methods *after* close returns), this is a distinct *concurrent* race where the check passes on a live session that is then destroyed mid-flight by another thread.",
+    "impact": "Native heap corruption, potential arbitrary code execution, or crash. An attacker who can influence the timing of session operations (e.g., by triggering cancellation/close from one coroutine while inference runs on another) can trigger undefined behavior in the native layer.",
+    "attack_path": "1. Application calls `session.generateContentStream(...)` on background thread (Thread B). 2. Thread B enters `generateContentStream`, passes `checkIsAlive()`, but is preempted before the JNI call. 3. Another thread (Thread A) calls `session.close()`, which atomically flips `_isAlive` to false and calls `nativeDeleteSession(handle)`, freeing the native Session object. 4. Thread B resumes and calls `nativeGenerateContentStream(handle, ...)` on the now-freed native pointer.",
+    "evidence": [
+      "kotlin/java/com/google/ai/edge/litertlm/Session.kt:39-44",
+      "kotlin/java/com/google/ai/edge/litertlm/Session.kt:58-61",
+      "kotlin/java/com/google/ai/edge/litertlm/Session.kt:88-91",
+      "kotlin/java/com/google/ai/edge/litertlm/Session.kt:102-106",
+      "kotlin/java/com/google/ai/edge/litertlm/Session.kt:140-142"
+    ],
+    "remediation": "Wrap all Session methods (runPrefill, runDecode, generateContent, generateContentStream, cancelProcess, close) in a shared `synchronized(lock)` block, or use a ReentrantReadWriteLock where operational methods take a read lock and `close()` takes a write lock. This ensures close() cannot proceed while any operation is in flight, and operations cannot start if close() has begun.",
+    "poc_video_notes": "Demonstrate by launching two coroutines: one calling `generateContentStream` in a loop and another calling `close()` after a short delay. With ASAN enabled, the freed-memory access will be flagged."
+  },
+  {
+    "severity": "HIGH",
+    "location": "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc",
+    "title": "JNI async callback race: shared_ptr<bool> terminal_reached accessed without synchronization",
+    "description": "In `nativeSendMessageAsync`, the `terminal_reached` flag is a `std::shared_ptr<bool>` that is read and written from multiple threads (the native callback thread and potentially the JNI cleanup lambda) without any synchronization primitive. The `callback_fn` lambda reads `*terminal_reached` (line 979) and the nested `on_done_fn` lambda both reads and writes it (lines 986-987). These accesses can occur concurrently if two callbacks arrive on different threads, or if `on_done_fn` is invoked concurrently with a late-arriving callback. This is a data race under the C++ memory model, leading to undefined behavior.",
+    "impact": "The data race can result in double-deletion of the JNI global reference `callback_global` (if two threads both see `*terminal_reached == false` and proceed to `DeleteGlobalRef`) or use of a deleted global reference (if the reference is deleted by one thread while another thread is still calling methods on it). This leads to JVM heap corruption or a JNI crash.",
+    "attack_path": "1. Application calls `nativeSendMessageAsync` which installs a callback. 2. Two rapid back-to-back callbacks arrive from the native C++ decode thread and a cancellation or error path (e.g., kDone followed immediately by an error). 3. Both callbacks execute concurrently, both read `*terminal_reached` as false, both proceed to call `on_done_fn`, both call `DeleteGlobalRef(callback_global)`. 4. The second DeleteGlobalRef crashes or corrupts the JVM reference table.",
+    "evidence": [
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:974",
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:978-979",
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:985-987",
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:991"
+    ],
+    "remediation": "Replace `std::shared_ptr<bool>` with `std::shared_ptr<std::atomic<bool>>` and use `compare_exchange_strong` in `on_done_fn` to ensure exactly-once cleanup semantics: `bool expected = false; if (terminal_reached->compare_exchange_strong(expected, true)) { /* do cleanup */ }`.",
+    "poc_video_notes": "Trigger by rapidly calling `cancelProcess()` on a Conversation immediately after `sendMessageAsync` begins streaming. With TSAN, the data race will be detected."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc",
+    "title": "JNI CreateBenchmarkInfoJni: unsigned underflow when GetTotalPrefillTurns/GetTotalDecodeTurns returns 0",
+    "description": "In `CreateBenchmarkInfoJni`, the function calls `benchmark_info.GetPrefillTokensPerSec(benchmark_info.GetTotalPrefillTurns() - 1)` and `benchmark_info.GetDecodeTokensPerSec(benchmark_info.GetTotalDecodeTurns() - 1)` (lines 168-171). If `GetTotalPrefillTurns()` or `GetTotalDecodeTurns()` returns 0, then `0 - 1` underflows to a large value (either as unsigned or wraps as signed). The function calls these unconditionally even though the preceding `if` blocks (lines 151, 160) that check for >0 only guard the token count retrieval, not the tokens-per-second retrieval. The `GetPrefillTokensPerSec` and `GetDecodeTokensPerSec` methods are then called with an out-of-bounds index.",
+    "impact": "Depending on the implementation of `GetPrefillTokensPerSec` and `GetDecodeTokensPerSec`, this causes an out-of-bounds read or returns garbage data. If those functions index an internal vector without bounds checking, this results in a memory read past the end of an allocated buffer.",
+    "attack_path": "1. Application enables benchmarking. 2. Calls `getBenchmarkInfo()` on a Conversation (via JNI) before any prefill or decode has occurred (0 turns). 3. JNI code computes `0 - 1` as the index, passing a very large or negative index to the benchmark methods. 4. Out-of-bounds vector access occurs in the native code.",
+    "evidence": [
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:150-157",
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:159-166",
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:168-171"
+    ],
+    "remediation": "Guard the tokens-per-second retrieval with the same >0 check used for the token count retrieval. For example: `double last_prefill_tokens_per_second = (benchmark_info.GetTotalPrefillTurns() > 0) ? benchmark_info.GetPrefillTokensPerSec(benchmark_info.GetTotalPrefillTurns() - 1) : 0.0;`",
+    "poc_video_notes": "Call `engine.createConversation()` with benchmark enabled, then immediately call `conversation.getBenchmarkInfo()` without sending any messages."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "c/engine.cc",
+    "title": "C API dangling pointer in CreateConversationCallback: callback receives pointer to destroyed stack string",
+    "description": "In `CreateConversationCallback` (lines 73-88), when the message is not empty, the callback receives `const_cast<char*>(json_str.c_str())` where `json_str` is a local `std::string` declared inside the lambda. Similarly, on error, `error_str` is a local string and its `.c_str()` is passed to the callback. Both strings are destroyed when the lambda scope exits. If the callback stores or uses these pointers asynchronously (e.g., in another thread), the pointers are dangling. The C API contract states the chunk is 'only valid for the duration of the call', but the `const_cast<char*>` also violates const-correctness, inviting callers to modify the buffer.",
+    "impact": "If a C API consumer's callback function stores the pointer for later use (a common pattern in async C callbacks), they will read freed memory. Even within the callback's lifetime, the const_cast could lead to subtle bugs if the callback modifies the string. The streaming nature makes this especially risky since callbacks fire rapidly.",
+    "attack_path": "1. C API consumer calls `litert_lm_conversation_send_message_stream` with a callback that enqueues chunks for later processing. 2. The callback stores the `chunk` pointer in a queue. 3. After the callback returns, `json_str` is destroyed and the pointer becomes dangling. 4. Consumer thread reads from the queued pointer, accessing freed heap memory.",
+    "evidence": [
+      "c/engine.cc:73-88",
+      "c/engine.cc:78",
+      "c/engine.cc:85"
+    ],
+    "remediation": "Remove the `const_cast` and either: (a) document prominently that the pointer is only valid during the callback invocation, or (b) change the callback signature to accept `const char*` and ensure the caller copies the data if needed. Alternatively, provide a callback variant that transfers ownership of the string.",
+    "poc_video_notes": "Write a C program that stores chunk pointers in an array and prints them after stream completion. Observe garbage/crash when reading stored pointers."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc",
+    "title": "JNI nativeGenerateContentStream: cleanup_callback_ref double-free risk on JVM thread reuse",
+    "description": "In `nativeGenerateContentStream` (lines 698-784), the `cleanup_callback_ref` lambda captures `callback_global` and is responsible for deleting the JNI global reference. This lambda is moved into `callback_fn`. If `callback_fn` is invoked for a kDone or error state, it calls `cleanup_callback_ref()` which deletes the global ref. However, for the normal streaming case (non-final tokens at line 754-759), the lambda calls `CallVoidMethod` on `callback_global` but does NOT call `cleanup_callback_ref`. The cleanup only happens on terminal states. If the native layer encounters an error after sending a successful non-final callback, the cleanup is called. But if `callback_fn` is destroyed without ever reaching a terminal state (e.g., if the Session is destroyed while streaming), the `cleanup_callback_ref` AnyInvocable destructor runs without being called, and the global reference is leaked. This is a resource leak rather than a double-free, but the asymmetric cleanup pattern is fragile.",
+    "impact": "JNI global reference leak. Each leaked global reference consumes a slot in the JVM's global reference table. Repeated leaks (e.g., from repeatedly starting and canceling streams) will eventually exhaust the table, causing JNI calls to fail and the application to crash with a 'JNI ERROR: global reference table overflow' error.",
+    "attack_path": "1. Application starts streaming inference via `generateContentStream`. 2. Application destroys the Session (or the native callback pipeline is torn down) before the stream reaches completion or error. 3. The `callback_fn` AnyInvocable is destroyed, but since `cleanup_callback_ref` was never invoked, the JNI global reference to `callback` is leaked. 4. Repeated triggering causes global reference table exhaustion.",
+    "evidence": [
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:715",
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:725-732",
+      "kotlin/java/com/google/ai/edge/litertlm/jni/litertlm.cc:734-775"
+    ],
+    "remediation": "Ensure `cleanup_callback_ref` is always called, either as part of the normal terminal-state handling or via RAII. One approach: wrap the global ref in a small class with a destructor that calls `DeleteGlobalRef`, and share it via `shared_ptr`. When the last reference is dropped (including from `callback_fn`'s destructor), the ref is cleaned up.",
+    "poc_video_notes": "Start many streaming inferences and immediately destroy the Session before they complete. Monitor JNI global reference count with `-verbose:jni` or `jni_ref_count` tooling."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "kotlin/java/com/google/ai/edge/litertlm/Tool.kt",
+    "title": "Tool execution error swallowed silently, including security-sensitive failures",
+    "description": "In `ToolManager.execute()` (lines 222-231), all exceptions thrown during tool execution are caught by a blanket `catch (e: Exception)` block and converted to a `JsonPrimitive(\"Error occured. ${e.toString()}\")`. This error message is then sent back to the LLM as a tool response. This has two security implications: (1) The exception's `toString()` may leak sensitive information (stack traces, file paths, internal state) into the LLM's context, which could be exfiltrated through the model's response. (2) The `IllegalArgumentException(\"Tool not found\")` for an unrecognized tool name is also swallowed, meaning the LLM can probe for available tools by name without any error propagating to the application.",
+    "impact": "Information disclosure via exception messages leaked to the model context. The model can exfiltrate internal error details (class names, file paths, stack traces) by calling non-existent tools or triggering exceptions in real tools, then including the error text in its visible output.",
+    "attack_path": "1. A malicious prompt causes the model to emit a tool_call with a crafted function name that triggers a specific exception path (e.g., a tool that performs file I/O and throws with the path in the message). 2. The exception's toString() including stack trace and file paths is returned to the model as a tool response. 3. The model includes this information in its next text response, visible to the user/attacker.",
+    "evidence": [
+      "kotlin/java/com/google/ai/edge/litertlm/Tool.kt:222-231",
+      "kotlin/java/com/google/ai/edge/litertlm/Tool.kt:226"
+    ],
+    "remediation": "Sanitize the error message before returning it to the model. Instead of `e.toString()`, return a generic message like `JsonPrimitive(\"Tool execution failed.\")`. Log the full exception details server-side for debugging. Consider distinguishing tool-not-found from execution errors and propagating tool-not-found to the application layer.",
+    "poc_video_notes": "Register a tool that accesses a file and observe the full stack trace returned to the model in its response context when the file is missing."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "runtime/core/engine_impl.cc",
+    "title": "Singleton Environment initialized with first caller's settings, subsequent callers silently ignore theirs",
+    "description": "The `GetEnvironment()` function (lines 68-135) uses `static absl::NoDestructor<absl::StatusOr<Environment>>` to create a singleton LiteRT Environment. The singleton's lambda captures its arguments by reference and is evaluated only on the first call. All subsequent calls return the same Environment regardless of the `engine_settings` and `model_resources` arguments passed. If a second Engine is created with different settings (e.g., different backend, different dispatch library path), those settings are silently ignored. This is a design flaw with security implications when different security contexts require different configurations.",
+    "impact": "An application that creates multiple Engines with different backend configurations (e.g., one CPU, one GPU, or different NPU dispatch library paths) will silently use the first Engine's environment for all subsequent Engines. This could lead to using an unintended backend, loading wrong dispatch libraries, or having incorrect magic number configurations, all without any error or warning. In a multi-tenant scenario, the first tenant's configuration would apply to all subsequent tenants.",
+    "attack_path": "1. First tenant initializes an Engine with a specific NPU dispatch library from path A. The singleton Environment is created with path A's configuration. 2. Second tenant initializes an Engine expecting to use dispatch library from path B. 3. The singleton returns the Environment created with path A, so the second tenant's Engine uses path A's dispatch library. 4. If path A's library is attacker-controlled, the attacker's code runs in the second tenant's context.",
+    "evidence": [
+      "runtime/core/engine_impl.cc:68-135",
+      "runtime/core/engine_impl.cc:72-73",
+      "runtime/core/engine_impl.cc:131-134"
+    ],
+    "remediation": "At minimum, log a warning or return an error when subsequent calls to `GetEnvironment` provide settings that differ from the cached singleton's configuration. Ideally, either make the Environment per-Engine (not singleton) or validate that all callers provide compatible settings.",
+    "poc_video_notes": "Create two engines with different backend settings and observe via logging that the second engine uses the first engine's environment configuration."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "runtime/core/session_basic.cc",
+    "title": "SessionBasic session_state_ and last_prefill_token_id_ not protected by any synchronization",
+    "description": "The `SessionBasic` class uses `session_state_` (an enum) and `last_prefill_token_id_` (an int) to track session state across prefill and decode operations. These fields are read and written in `PrefillInternal` (line 292-293), `RunPrefill` (line 316-319), `DecodeInternal` (line 399, 420), and the lambdas scheduled on the worker thread pool (lines 378-393, 507-511). While the ThreadPool uses a single worker thread, the main thread also accesses `session_state_` in `RunPrefill` (line 316), `GenerateContentStream` (line 598), and through `checkIsAlive`-like patterns. Since `session_state_` is not atomic and not guarded by a mutex, concurrent access from the main thread and the worker thread creates a data race under the C++ memory model.",
+    "impact": "Data race on `session_state_` and `last_prefill_token_id_` can cause the session to proceed with decode before prefill is complete, or use an uninitialized `last_prefill_token_id_` value, leading to incorrect model behavior or crashes in the native executor.",
+    "attack_path": "1. Application calls `GenerateContentStream`, which schedules `RunPrefillAsync` on the worker thread. 2. The main thread calls `RunPrefill` or another state-checking method concurrently. 3. The worker thread writes `session_state_ = SessionState::kPrefilled` while the main thread reads `session_state_` without synchronization. 4. The compiler or CPU reorders the write to `last_prefill_token_id_` relative to `session_state_`, so the decode path reads an uninitialized or stale `last_prefill_token_id_`.",
+    "evidence": [
+      "runtime/core/session_basic.h:216",
+      "runtime/core/session_basic.h:242",
+      "runtime/core/session_basic.cc:292-293",
+      "runtime/core/session_basic.cc:316-319",
+      "runtime/core/session_basic.cc:399",
+      "runtime/core/session_basic.cc:420"
+    ],
+    "remediation": "Make `session_state_` an `std::atomic<SessionState>` and `last_prefill_token_id_` an `std::atomic<int>`, or protect all accesses to these fields with the same mutex. Since the worker thread pool is single-threaded, the most practical fix is to ensure `session_state_` is only read from the worker thread or under a mutex.",
+    "poc_video_notes": "Run with TSAN enabled and call GenerateContentStream followed by a quick check of session state from the main thread."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "c/engine.cc",
+    "title": "C API ToEngineInputData: null data pointer dereference for text/image/audio types",
+    "description": "The `ToEngineInputData` function (lines 102-129) constructs `std::string` objects from `inputs[i].data` and `inputs[i].size` for text, image, and audio types. If a caller passes `inputs[i].data = NULL` with `inputs[i].size > 0`, the `std::string` constructor `std::string(static_cast<const char*>(nullptr), size)` results in undefined behavior (null pointer dereference). The function does not validate that `data` is non-null before constructing the string. For `kLiteRtLmInputDataTypeImageEnd` and `kLiteRtLmInputDataTypeAudioEnd` types, `data` is not used, so they are safe.",
+    "impact": "A null pointer dereference causes an immediate crash (SIGSEGV). A carefully crafted input with `data=NULL, size=0` creates an empty string silently, but `data=NULL, size>0` crashes. This is exploitable for denial of service by any code path that passes user-controlled input through the C API.",
+    "attack_path": "1. C API consumer creates an `LiteRtLmInputData` struct with `type = kLiteRtLmInputDataTypeText`, `data = NULL`, `size = 5`. 2. Consumer calls `litert_lm_session_run_prefill` or `litert_lm_session_generate_content`. 3. `ToEngineInputData` constructs `std::string(nullptr, 5)`, causing undefined behavior/crash.",
+    "evidence": [
+      "c/engine.cc:102-129",
+      "c/engine.cc:109-110",
+      "c/engine.cc:113-114",
+      "c/engine.cc:120-121"
+    ],
+    "remediation": "Add null checks for `inputs[i].data` when the type requires data (text, image, audio): `if (inputs[i].data == nullptr && inputs[i].size > 0) { return {}; /* or log error */ }`. Consider also validating that `size > 0` for types that require actual data content.",
+    "poc_video_notes": "Call `litert_lm_session_run_prefill` with a single LiteRtLmInputData where type is text, data is NULL, and size is 1."
+  },
+  {
+    "severity": "LOW",
+    "location": "kotlin/java/com/google/ai/edge/litertlm/Engine.kt",
+    "title": "Engine.isInitialized() reads volatile handle outside synchronized block, enabling inconsistent observations",
+    "description": "The public method `isInitialized()` (line 48-50) reads the `@Volatile handle` field without holding the `lock`. While volatile ensures visibility, callers who use `isInitialized()` to make decisions (e.g., 'if engine is initialized, use it') face a TOCTOU race because the engine could be closed between the check and the use. The `checkInitialized()` method (line 180-182) also reads `handle` outside the `lock` via `isInitialized()`, but this is only called from within `synchronized(lock)` blocks, so it's safe internally. The vulnerability is in external code that calls `isInitialized()` without holding the lock.",
+    "impact": "Application code checking `engine.isInitialized()` before calling `createConversation()` could see `true` and then have the engine closed by another thread before `createConversation()` is invoked. While `createConversation()` itself is synchronized, the external check-then-act pattern is broken. This is primarily a correctness issue but could lead to unexpected IllegalStateException in production.",
+    "attack_path": "1. Thread A calls `engine.isInitialized()`, gets `true`. 2. Thread B calls `engine.close()`, which succeeds. 3. Thread A calls `engine.createConversation()`, which throws `IllegalStateException('Engine is not initialized')` even though Thread A just checked.",
+    "evidence": [
+      "kotlin/java/com/google/ai/edge/litertlm/Engine.kt:48-50",
+      "kotlin/java/com/google/ai/edge/litertlm/Engine.kt:180-182"
+    ],
+    "remediation": "Document that `isInitialized()` is an instantaneous snapshot and callers must not rely on it for thread-safe check-then-act patterns. Alternatively, provide a `withEngine` or `tryCreateConversation` API that atomically checks and operates.",
+    "poc_video_notes": "Not needed for low severity; explain in documentation."
+  },
+  {
+    "severity": "LOW",
+    "location": "runtime/framework/resource_registry.h",
+    "title": "ResourceRegistry.View() returns reference that can become dangling",
+    "description": "The `View()` method (lines 144-159) acquires the registry's main mutex to look up a resource and returns a `const T&` reference. However, the mutex is released when the `MutexLock` goes out of scope at the end of the method. After the method returns, another thread could theoretically modify or destroy the registry (though currently the registry doesn't support removal). The returned reference has no lock protection and is only valid 'as long as the resource is not modified or destroyed'. The comment on line 142 acknowledges this limitation, but the API makes it easy for callers to hold the reference too long.",
+    "impact": "If resource removal is added to ResourceRegistry in the future, existing callers of `View()` would silently become unsafe. Currently, since resources cannot be removed, this is a design smell rather than an active vulnerability.",
+    "attack_path": "No current attack path since resources cannot be removed from the registry. Future risk if a `Deregister` or `Remove` method is added.",
+    "evidence": [
+      "runtime/framework/resource_registry.h:144-159"
+    ],
+    "remediation": "Consider returning a `ResourceScopedLock<const T>` (read-locked) from `View()` to ensure the resource remains valid while the caller uses it. Alternatively, add a prominent comment warning that this API is only safe because resources are never removed.",
+    "poc_video_notes": "N/A - future risk only."
+  },
+  {
+    "severity": "LOW",
+    "location": "kotlin/java/com/google/ai/edge/litertlm/Conversation.kt",
+    "title": "Async tool call handler re-enters JNI from callback thread without synchronized access to Conversation state",
+    "description": "In `JniMessageCallbackImpl.onDone()` (lines 362-377), when a pending tool response exists, the callback re-invokes `nativeSendMessageAsync` using the Conversation's `handle`. This re-invocation occurs on the native callback thread, which may be different from the thread that originally called `sendMessageAsync`. The `toolCallCount` and `pendingToolResponseJSONMessage` fields of `JniMessageCallbackImpl` are accessed from the callback thread without synchronization. While `JniMessageCallbackImpl` is only used from one stream at a time, if the callback thread is the native worker thread and it's different from the thread that checks `toolCallCount`, there's no happens-before relationship guaranteeing visibility of the increment.",
+    "impact": "The `toolCallCount` may not be properly visible across threads, potentially allowing the model to exceed the `RECURRING_TOOL_CALL_LIMIT` of 25. In practice, this is unlikely to cause more than one extra tool call, but it weakens the safety limit.",
+    "attack_path": "1. Model emits tool calls in streaming mode. 2. Callback thread increments `toolCallCount` and sets `pendingToolResponseJSONMessage`. 3. On the next callback, if the JVM doesn't guarantee happens-before between the native callback invocations (unlikely but theoretically possible on relaxed memory architectures), `toolCallCount` could be stale.",
+    "evidence": [
+      "kotlin/java/com/google/ai/edge/litertlm/Conversation.kt:337",
+      "kotlin/java/com/google/ai/edge/litertlm/Conversation.kt:347-355",
+      "kotlin/java/com/google/ai/edge/litertlm/Conversation.kt:362-377"
+    ],
+    "remediation": "Make `toolCallCount` and `pendingToolResponseJSONMessage` volatile or use `AtomicInteger`/`AtomicReference` to ensure visibility across threads. Alternatively, document that the callback implementation assumes single-threaded callback invocation from the native layer.",
+    "poc_video_notes": "Requires a model that consistently triggers tool calls in streaming mode to observe potential limit bypass."
+  }
+]
